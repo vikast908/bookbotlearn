@@ -17,6 +17,16 @@ Training Time:    ~5 min on GPU, ~30 min on CPU
 - [Why This Project?](#why-this-project)
 - [Quick Start](#quick-start)
 - [Project Structure](#project-structure)
+- [Data Flow: End-to-End Pipeline](#data-flow-end-to-end-pipeline)
+  - [Phase 1: Data Acquisition](#phase-1-data-acquisition)
+  - [Phase 2: Tokenization](#phase-2-tokenization)
+  - [Phase 3: Dataset Creation](#phase-3-dataset-creation)
+  - [Phase 4: Batching with DataLoader](#phase-4-batching-with-dataloader)
+  - [Phase 5: Forward Pass Through the Model](#phase-5-forward-pass-through-the-model)
+  - [Phase 6: Loss Computation and Backpropagation](#phase-6-loss-computation-and-backpropagation)
+  - [Phase 7: Optimizer Step](#phase-7-optimizer-step)
+  - [Phase 8: Evaluation and Checkpointing](#phase-8-evaluation-and-checkpointing)
+  - [Phase 9: Text Generation (Inference)](#phase-9-text-generation-inference)
 - [Architecture Deep Dive](#architecture-deep-dive)
   - [The Big Picture](#the-big-picture)
   - [Parameter Budget](#parameter-budget)
@@ -156,6 +166,516 @@ bookbotlearn/
 9. `data/dataset.py` — How we create training examples
 10. `train.py` — How the model learns
 11. `generate.py` — How the model creates text
+
+---
+
+## Data Flow: End-to-End Pipeline
+
+This section traces every transformation the data undergoes, from raw text on the internet to generated Shakespeare, with every parameter and shape annotated.
+
+```
+                        TRAINING PIPELINE
+                        =================
+
+Internet (GitHub)                        Trained Model
+    │                                         │
+    ▼                                         ▼
+[Raw Text]──► [Tokens]──► [IDs]──► [Batches]──► [Model]──► [Loss]──► [Backprop]──► [Update Weights]
+ 1.1 MB       ~210K       ints     (64,128)     forward     scalar     gradients     AdamW
+Shakespeare   words       0-1999   tensors      pass        cross-     ∂L/∂w         step
+                                                            entropy
+
+
+                        INFERENCE PIPELINE
+                        ==================
+
+[Prompt]──► [Encode]──► [Model Forward]──► [Logits]──► [Sample]──► [Append]──► [Decode]──► [Text]
+"ROMEO:"    [token IDs]  (1, seq, 2000)    last pos    temp+top-k   loop        join words   output
+                                           (1, 2000)   → next ID    ×max_tokens
+```
+
+### Phase 1: Data Acquisition
+
+**File:** `data/download.py` | **Function:** `download_shakespeare()`
+
+```
+Source:  https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+   │
+   ▼  urllib.request.urlretrieve()
+   │
+Saved:  data/input.txt
+   │
+   Stats: ~1.1 MB | ~40,000 lines | ~900,000 characters | ~25,000 unique words
+```
+
+The Tiny Shakespeare dataset is all of Shakespeare's works concatenated into a single text file. If `data/input.txt` already exists, the download is skipped.
+
+### Phase 2: Tokenization
+
+**File:** `data/tokenizer.py` | **Class:** `WordTokenizer`
+
+The tokenizer converts raw text into integer IDs that the model can process.
+
+```
+Step 2a: Lowercase
+   "First Citizen:" → "first citizen:"
+
+Step 2b: Regex tokenization (TOKEN_PATTERN = r"[a-zA-Z']+|[.,!?;:\-\"]")
+   "first citizen:" → ["first", "citizen", ":"]
+   - Words (including contractions like "he'll") become tokens
+   - Each punctuation mark becomes its own token
+   - Whitespace, numbers, rare symbols are discarded
+
+Step 2c: Count frequencies (Counter)
+   {"the": 23,243, "and": 13,891, "i": 12,456, "to": 11,234, ...}
+   Total: ~210,000 tokens | ~14,000 unique tokens
+
+Step 2d: Build vocabulary (top 2000 - 4 special tokens = 1,996 regular words)
+   Index 0: <pad>    (padding)
+   Index 1: <unk>    (unknown/out-of-vocabulary)
+   Index 2: <bos>    (beginning of sequence)
+   Index 3: <eos>    (end of sequence)
+   Index 4: "the"    (most frequent word)
+   Index 5: ","      (second most frequent)
+   ...
+   Index 1999: (1996th most frequent word)
+
+   Coverage: top 2000 words cover ~95% of all token occurrences (Zipf's law)
+   Remaining ~12,000 rare words → mapped to <unk> (index 1)
+
+Step 2e: Encode entire corpus
+   "first citizen:" → [234, 891, 5]  (hypothetical indices)
+
+   tokenizer.encode(text) → List[int] of ~210,000 token IDs
+
+Step 2f: Save vocabulary
+   data/vocab.json ← {"word2idx": {"<pad>": 0, "<unk>": 1, ...}, "vocab_size": 2000}
+```
+
+**Key parameters:**
+| Parameter | Value | Role |
+|---|---|---|
+| `config.vocab_size` | 2000 | Maximum vocabulary size (including 4 special tokens) |
+| `TOKEN_PATTERN` | `r"[a-zA-Z']+\|[.,!?;:\-\"]"` | Regex that splits text into word and punctuation tokens |
+
+### Phase 3: Dataset Creation
+
+**File:** `data/dataset.py` | **Function:** `create_datasets()` | **Class:** `ShakespeareDataset`
+
+The encoded corpus is split and windowed into (input, target) training pairs.
+
+```
+Step 3a: Train/Val split by position (90/10)
+   All token IDs: [45, 12, 7, 89, 3, 56, 102, 23, ...]  (~210,000 IDs)
+                   |◄──────── 90% train ────────►|◄─ 10% val ─►|
+   split_idx = int(210,000 × 0.9) = 189,000
+   Train: token_ids[0 : 189,000]      → ~189,000 tokens
+   Val:   token_ids[189,000 : end]    → ~21,000 tokens
+
+Step 3b: Convert to PyTorch LongTensor
+   self.data = torch.tensor(token_ids, dtype=torch.long)
+
+Step 3c: Sliding window to create samples
+   seq_len = config.max_seq_len = 128
+
+   Sample 0:  x = data[0   : 128]    y = data[1   : 129]
+   Sample 1:  x = data[1   : 129]    y = data[2   : 130]
+   Sample 2:  x = data[2   : 130]    y = data[3   : 131]
+   ...
+   Sample N:  x = data[N   : N+128]  y = data[N+1 : N+129]
+
+   Total train samples: 189,000 - 128 = 188,872
+   Total val samples:   ~21,000 - 128 = ~20,872
+
+   Each x: (128,) tensor of input token IDs
+   Each y: (128,) tensor of target token IDs (x shifted right by 1)
+
+   At every position i in x, the model must predict y[i] = x[i+1]
+```
+
+**Key parameters:**
+| Parameter | Value | Role |
+|---|---|---|
+| `config.max_seq_len` | 128 | Window size (context length) for each training sample |
+| `train_split` | 0.9 | Fraction of corpus used for training (rest is validation) |
+
+### Phase 4: Batching with DataLoader
+
+**File:** `data/dataset.py` | **Function:** `create_dataloaders()`
+
+```
+Step 4a: Wrap in DataLoader
+   Train DataLoader: shuffle=True, drop_last=True, batch_size=64
+   Val DataLoader:   shuffle=False, drop_last=False, batch_size=64
+
+Step 4b: Each iteration yields a batch
+   x batch: (64, 128) — 64 samples, each 128 tokens long (LongTensor)
+   y batch: (64, 128) — corresponding targets
+
+   Train batches per epoch: 188,872 // 64 = ~2,951
+   Val batches:             ~20,872 // 64 = ~326
+
+Step 4c: Move to device
+   x, y = x.to(device), y.to(device)   # CPU or CUDA GPU
+```
+
+**Key parameters:**
+| Parameter | Value | Role |
+|---|---|---|
+| `config.batch_size` | 64 | Number of samples per gradient update |
+| `shuffle` | True (train) | Randomize sample order each epoch to prevent memorization |
+| `drop_last` | True (train) | Discard incomplete last batch for consistent batch size |
+
+### Phase 5: Forward Pass Through the Model
+
+**File:** `model/transformer.py` | **Class:** `MiniGPT` | **Method:** `forward()`
+
+This is where the data flows through every layer of the neural network.
+
+```
+INPUT: x of shape (64, 128) — batch of 64 sequences, each 128 token IDs
+       Each value is an integer in [0, 1999]
+
+═══════════════════════════════════════════════════════════════
+STEP 5a: Token Embedding  (model/transformer.py)
+═══════════════════════════════════════════════════════════════
+   nn.Embedding(vocab_size=2000, d_model=32)
+   Lookup table: each token ID → 32-dimensional vector
+   Weight matrix shape: (2000, 32) = 64,000 parameters
+
+   (64, 128) → (64, 128, 32)
+    batch,seq    batch, seq, d_model
+
+   Example: token ID 45 → [0.12, -0.34, 0.56, ..., 0.78]  (32 floats)
+
+═══════════════════════════════════════════════════════════════
+STEP 5b: Positional Encoding  (model/positional.py)
+═══════════════════════════════════════════════════════════════
+   nn.Embedding(max_seq_len=128, d_model=32)
+   Learned position vectors (GPT-2 style)
+   Weight matrix shape: (128, 32) = 4,096 parameters
+
+   positions = [0, 1, 2, ..., 127]
+   pos_embeddings = self.embedding(positions)  → (128, 32)
+
+   x = token_embeddings + pos_embeddings       (broadcasts over batch)
+   (64, 128, 32) + (128, 32) → (64, 128, 32)
+
+   Now each vector encodes BOTH what the word is AND where it is.
+
+═══════════════════════════════════════════════════════════════
+STEP 5c: Embedding Dropout
+═══════════════════════════════════════════════════════════════
+   nn.Dropout(p=0.1)
+   Randomly zeros 10% of values during training (scale rest by 1/0.9)
+   Disabled during eval (model.eval())
+
+   (64, 128, 32) → (64, 128, 32)  (shape unchanged)
+
+═══════════════════════════════════════════════════════════════
+STEP 5d: Transformer Block 1  (model/transformer_block.py)
+═══════════════════════════════════════════════════════════════
+
+   ┌─── 5d-i: Pre-Norm LayerNorm (model/layernorm.py) ──────────────┐
+   │   gamma (32,) + beta (32,) = 64 parameters                     │
+   │   For each position independently:                              │
+   │     mean = mean of 32 features                                  │
+   │     var  = variance of 32 features                              │
+   │     x_norm = (x - mean) / sqrt(var + 1e-6)                     │
+   │     output = gamma * x_norm + beta                              │
+   │   (64, 128, 32) → (64, 128, 32)                                │
+   └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+   ┌─── 5d-ii: Multi-Head Self-Attention (model/attention.py) ──────┐
+   │                                                                 │
+   │   Linear projections (each: 32→32, i.e. 32×32+32 = 1,056 params):
+   │     Q = W_Q(x)  → (64, 128, 32)                                │
+   │     K = W_K(x)  → (64, 128, 32)                                │
+   │     V = W_V(x)  → (64, 128, 32)                                │
+   │                                                                 │
+   │   Reshape to split into 4 heads (d_k = 32/4 = 8 per head):     │
+   │     Q: (64, 128, 32) → (64, 128, 4, 8) → (64, 4, 128, 8)     │
+   │     K: same reshape                                             │
+   │     V: same reshape                                             │
+   │                                                                 │
+   │   Scaled Dot-Product Attention (per head):                      │
+   │     scores = Q @ K^T         → (64, 4, 128, 128)               │
+   │     scores = scores / sqrt(8) = scores / 2.83                   │
+   │     scores = masked_fill(causal_mask == 0, -inf)                │
+   │       Causal mask: lower-triangular (128×128), prevents         │
+   │       attending to future positions                              │
+   │     attn_weights = softmax(scores, dim=-1) → (64, 4, 128, 128) │
+   │     attn_weights = dropout(attn_weights, p=0.1)                 │
+   │     attn_output = attn_weights @ V       → (64, 4, 128, 8)     │
+   │                                                                 │
+   │   Concatenate heads:                                            │
+   │     (64, 4, 128, 8) → transpose → (64, 128, 4, 8) → (64, 128, 32)
+   │                                                                 │
+   │   Output projection W_O (32→32, 1,056 params):                 │
+   │     output = W_O(concat)     → (64, 128, 32)                   │
+   │                                                                 │
+   │   Total attention params: 4 × 1,056 = 4,224                    │
+   └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+   ┌─── 5d-iii: Dropout + Residual Connection ──────────────────────┐
+   │   attn_out = dropout(attn_out, p=0.1)                          │
+   │   x = residual + attn_out     (add back original input)        │
+   │   (64, 128, 32) → (64, 128, 32)                                │
+   └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+   ┌─── 5d-iv: Pre-Norm LayerNorm ──────────────────────────────────┐
+   │   Same as 5d-i, separate gamma/beta (64 params)                │
+   │   (64, 128, 32) → (64, 128, 32)                                │
+   └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+   ┌─── 5d-v: Feed-Forward Network (model/feedforward.py) ──────────┐
+   │                                                                 │
+   │   Linear1: d_model → d_ff (32→128, 32×128+128 = 4,224 params)  │
+   │     (64, 128, 32) → (64, 128, 128)                             │
+   │                                                                 │
+   │   GELU activation (smooth ReLU alternative):                    │
+   │     gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715*x³)))
+   │     (64, 128, 128) → (64, 128, 128)                            │
+   │                                                                 │
+   │   Dropout(p=0.1)                                                │
+   │                                                                 │
+   │   Linear2: d_ff → d_model (128→32, 128×32+32 = 4,128 params)   │
+   │     (64, 128, 128) → (64, 128, 32)                             │
+   │                                                                 │
+   │   Dropout(p=0.1)                                                │
+   │                                                                 │
+   │   Total FFN params: 4,224 + 4,128 = 8,352                      │
+   └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+   ┌─── 5d-vi: Residual Connection ─────────────────────────────────┐
+   │   x = residual + ffn_out                                        │
+   │   (64, 128, 32) → (64, 128, 32)                                │
+   └─────────────────────────────────────────────────────────────────┘
+
+   Block 1 total params: 4,224 (attn) + 8,352 (FFN) + 128 (2×LN) = 12,704
+
+═══════════════════════════════════════════════════════════════
+STEP 5e: Transformer Block 2  (identical structure)
+═══════════════════════════════════════════════════════════════
+   Same architecture, separate weights (another 12,704 params)
+   (64, 128, 32) → (64, 128, 32)
+
+═══════════════════════════════════════════════════════════════
+STEP 5f: Final Layer Norm  (model/layernorm.py)
+═══════════════════════════════════════════════════════════════
+   gamma (32,) + beta (32,) = 64 parameters
+   (64, 128, 32) → (64, 128, 32)
+
+═══════════════════════════════════════════════════════════════
+STEP 5g: Output Head (Linear projection, weight-tied)
+═══════════════════════════════════════════════════════════════
+   nn.Linear(d_model=32, vocab_size=2000)
+   Weight is SHARED with token embedding (weight tying)
+     → No additional weight params (saves 64,000!)
+     → Only the bias is new: 2,000 parameters
+
+   (64, 128, 32) → (64, 128, 2000)
+    batch, seq, d_model    batch, seq, vocab_size
+
+   Output: LOGITS — unnormalized scores for every word at every position
+   logits[b][t][w] = how likely word w follows position t in sample b
+
+OUTPUT: logits of shape (64, 128, 2000)
+```
+
+### Phase 6: Loss Computation and Backpropagation
+
+**File:** `train.py` | **Training loop**
+
+```
+Step 6a: Reshape for cross-entropy
+   logits: (64, 128, 2000) → view(-1, 2000) → (8192, 2000)
+   targets: (64, 128)      → view(-1)       → (8192,)
+
+   8192 = 64 batches × 128 positions = total predictions per step
+
+Step 6b: Cross-entropy loss
+   F.cross_entropy(logits, targets)
+
+   For each of the 8,192 positions:
+     loss_i = -log(softmax(logits_i)[target_i])
+              = -log(P(correct word at position i))
+
+   Final loss = mean over all 8,192 positions → single scalar
+
+   Starting loss ≈ ln(2000) ≈ 7.6  (random guessing)
+   Good trained loss ≈ 4.0-5.0
+
+Step 6c: Backward pass
+   optimizer.zero_grad()     # Clear old gradients
+   loss.backward()           # Compute ∂loss/∂param for ALL 95,568 parameters
+                             # via chain rule (automatic differentiation)
+
+Step 6d: Gradient clipping
+   grad_norm = clip_grad_norm_(model.parameters(), max_norm=1.0)
+   If ||all gradients|| > 1.0, scale them down proportionally
+   Prevents exploding gradients from destabilizing training
+```
+
+**Key parameters:**
+| Parameter | Value | Role |
+|---|---|---|
+| `config.grad_clip` | 1.0 | Maximum allowed gradient norm |
+
+### Phase 7: Optimizer Step
+
+**File:** `train.py` | **Functions:** `get_lr()`, `configure_optimizer()`
+
+```
+Step 7a: Compute learning rate for current step
+   if step < 200 (warmup):
+     lr = 3e-4 × (step / 200)        # Linear ramp from 0 to 3e-4
+   else (cosine annealing):
+     progress = (step - 200) / (5000 - 200)
+     lr = 3e-5 + 0.5 × (3e-4 - 3e-5) × (1 + cos(π × progress))
+     # Smooth decay from 3e-4 to 3e-5
+
+Step 7b: Update learning rate in optimizer
+   for param_group in optimizer.param_groups:
+       param_group["lr"] = lr
+
+Step 7c: AdamW optimizer step
+   Two parameter groups:
+     Group 1: 2D+ tensors (weight matrices) — with weight_decay=0.01
+     Group 2: 1D tensors (biases, LayerNorm γ/β) — with weight_decay=0.0
+
+   For each parameter:
+     m = β1 × m + (1-β1) × grad             # Update 1st moment (momentum)
+     v = β2 × v + (1-β2) × grad²            # Update 2nd moment (RMS)
+     m̂ = m / (1 - β1^t)                     # Bias correction
+     v̂ = v / (1 - β2^t)                     # Bias correction
+     param = param - lr × m̂ / (√v̂ + ε)     # Adam update
+     param = param - lr × weight_decay × param  # Decoupled weight decay (group 1 only)
+```
+
+**Key parameters:**
+| Parameter | Value | Role |
+|---|---|---|
+| `config.learning_rate` | 3e-4 | Peak learning rate (after warmup) |
+| `config.min_lr` | 3e-5 | Minimum learning rate at end of cosine decay |
+| `config.warmup_steps` | 200 | Steps for linear LR warmup |
+| `config.max_steps` | 5000 | Total training steps (controls cosine schedule) |
+| `config.weight_decay` | 0.01 | L2 regularization strength on weight matrices |
+
+### Phase 8: Evaluation and Checkpointing
+
+**File:** `train.py` | **Functions:** `evaluate()`, `save_checkpoint()`
+
+```
+Step 8a: Evaluate on validation set (every 500 steps)
+   model.eval()                      # Disable dropout
+   for x, y in val_loader:           # Iterate all ~326 val batches
+     logits = model(x)               # Forward pass (no gradient computation)
+     loss += cross_entropy(logits, y)
+   val_loss = total_loss / num_batches
+   val_perplexity = exp(val_loss)    # "How many words is it choosing between?"
+   model.train()                     # Re-enable dropout
+
+Step 8b: Save checkpoint (if val_loss improved)
+   torch.save({
+     "model_state_dict":     all 95,568 trained parameters,
+     "optimizer_state_dict":  Adam momentum/variance states,
+     "config":               TransformerConfig dataclass,
+     "step":                 current training step,
+     "val_loss":             best validation loss,
+   }, "checkpoints/model.pt")
+
+Step 8c: Training complete (after max_steps)
+   Final evaluation on validation set
+   Save final checkpoint regardless of improvement
+   Report: total steps, final val loss, best val loss, total time
+```
+
+**Key parameters:**
+| Parameter | Value | Role |
+|---|---|---|
+| `config.eval_interval` | 500 | Evaluate on validation set every N steps |
+| `config.log_interval` | 100 | Print training metrics every N steps |
+| `config.max_steps` | 5000 | Stop training after this many steps |
+| `config.max_epochs` | 20 | Maximum epochs (usually max_steps is hit first) |
+
+### Phase 9: Text Generation (Inference)
+
+**File:** `generate.py` | **Function:** `generate()`
+
+```
+INPUT: prompt = "ROMEO:"
+
+Step 9a: Encode prompt
+   tokenizer.encode("ROMEO:") → [456, 5]  (hypothetical IDs)
+   tokens = torch.tensor([[456, 5]])       → shape (1, 2)
+
+Step 9b: Autoregressive generation loop (repeat up to max_tokens times)
+   ┌────────────────────────────────────────────────────────────────┐
+   │                                                                │
+   │  9b-i: Truncate context to max_seq_len (128) if needed         │
+   │    context = tokens[:, -128:]                                  │
+   │                                                                │
+   │  9b-ii: Forward pass through entire model                      │
+   │    logits = model(context)        → (1, seq_len, 2000)        │
+   │                                                                │
+   │  9b-iii: Extract last position's prediction                    │
+   │    next_logits = logits[:, -1, :] → (1, 2000)                 │
+   │    "What word should come after the last token?"               │
+   │                                                                │
+   │  9b-iv: Temperature scaling                                    │
+   │    next_logits = next_logits / temperature                     │
+   │    T=0.8: logits/0.8 → sharper distribution (more confident)   │
+   │    T=1.0: unchanged                                            │
+   │    T=1.5: logits/1.5 → flatter distribution (more random)     │
+   │                                                                │
+   │  9b-v: Top-K filtering                                         │
+   │    Keep only top 40 logits, set rest to -inf                   │
+   │    Prevents sampling extremely unlikely nonsense words         │
+   │                                                                │
+   │  9b-vi: Convert to probabilities                               │
+   │    probs = softmax(next_logits)   → (1, 2000)                 │
+   │    Sum = 1.0 (only top-40 have nonzero probability)            │
+   │                                                                │
+   │  9b-vii: Sample next token                                     │
+   │    if temperature == 0:                                        │
+   │      next_token = argmax(probs)   → greedy (deterministic)    │
+   │    else:                                                       │
+   │      next_token = multinomial(probs, 1) → stochastic sample   │
+   │                                                                │
+   │  9b-viii: Append to sequence                                   │
+   │    tokens = cat([tokens, next_token], dim=1)                   │
+   │    (1, 2) → (1, 3) → (1, 4) → ... grows by 1 each iteration │
+   │                                                                │
+   │  9b-ix: Check stop condition                                   │
+   │    if next_token == 3 (<eos>): break                           │
+   │                                                                │
+   └────────────── repeat for up to max_tokens iterations ──────────┘
+
+Step 9c: Decode token IDs back to text
+   generated_ids = [456, 5, 891, 23, 7, ...]
+   tokenizer.decode(generated_ids)
+     1. Map each ID → word via idx2word lookup
+     2. Skip special tokens (<pad>, <unk>, <bos>, <eos>)
+     3. Join with spaces
+     4. Clean punctuation spacing: "hello , world" → "hello, world"
+     → "romeo: i will not be so bold..."
+
+OUTPUT: Generated text string
+```
+
+**Key parameters:**
+| Parameter | Value | Role |
+|---|---|---|
+| `temperature` | 0.8 | Controls randomness (0=greedy, 1=raw, >1=more random) |
+| `top_k` | 40 | Only sample from top 40 most likely words |
+| `max_tokens` | 100 | Maximum number of words to generate |
+| `config.max_seq_len` | 128 | Context window — oldest tokens dropped when exceeded |
 
 ---
 
